@@ -1,0 +1,22 @@
+{
+  "counts": {
+    "articles": 762,
+    "clusters": 569,
+    "outlets": 5
+  },
+  "date": "2025-10-20",
+  "files": [
+    "viz.lifecycles.json",
+    "viz.momentum.json",
+    "viz.divergence.json",
+    "viz.emotion.json",
+    "viz.compass.json",
+    "viz.silences.json",
+    "viz.clouds.json",
+    "viz.fingerprints.json",
+    "viz.cartogram.json",
+    "viz.entities.json",
+    "viz.influence.json"
+  ],
+  "version": 1
+}

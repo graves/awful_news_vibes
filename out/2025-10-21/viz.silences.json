@@ -1,0 +1,17 @@
+{
+  "expectations": [
+    {
+      "expectedButMissing": "No coverage of public or international reactions to the Louvre heist beyond elite media; no mention of museum staff, security workers, or French public sentiment.",
+      "theme": "Public and Institutional Response"
+    },
+    {
+      "expectedButMissing": "No mention of long-term consequences of the AWS outage on cloud infrastructure policy, despite widespread disruption.",
+      "theme": "Systemic Infrastructure Reform"
+    },
+    {
+      "expectedButMissing": "No discussion of the role of AI in shaping political narratives, despite multiple AI-related events (e.g., deepfakes, AI memes).",
+      "theme": "Technological and Ethical Governance"
+    }
+  ],
+  "by_outlet": []
+}
