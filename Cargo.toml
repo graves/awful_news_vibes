@@ -2,6 +2,14 @@
 name = "awful_news_vibes"
 version = "0.1.0"
 edition = "2021"
+authors = ["Thomas Gentry <thomas@awfulsec.com>"]
+license = "MIT"
+description = "Daily news meta-analysis pipeline with AI-powered clustering and D3 visualizations"
+readme = "README.md"
+homepage = "https://github.com/graves/awful_news_vibes"
+repository = "https://github.com/graves/awful_news_vibes"
+keywords = ["news", "ai", "analysis", "clustering", "visualization"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 anyhow = "1"
@@ -19,14 +27,14 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1"
 once_cell = "1"
-chrono-tz = "0.9"
+chrono-tz = "0.10.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures = "0.3"
 url = "2.5"
 
 # optional tighter token estimator
-tiktoken-rs = "0.5"
+tiktoken-rs = "0.7.0"
 
-# awful_aj (your crate); version as appropriate
-awful_aj = "*"
+# awful_aj for LLM orchestration
+awful_aj = "0.3.9"  # Update to actual version from crates.io
