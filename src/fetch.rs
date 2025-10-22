@@ -11,25 +11,45 @@ fn make_cluster_article_id(url: &str, title: &str) -> String {
 }
 
 /// Try to fetch one edition; return Ok(None) on 404 (missing edition)
-pub async fn fetch_edition_opt(client: &Client, ymd: &str, slot: &str) -> Result<Option<Edition>> {
-    let url = format!("https://news.awfulsec.com/api/{}/{}.json", ymd, slot);
+/// If api_dir is provided, reads from local filesystem instead of HTTP
+pub async fn fetch_edition_opt(client: &Client, ymd: &str, slot: &str, api_dir: Option<&str>) -> Result<Option<Edition>> {
     let start = std::time::Instant::now();
     
-    debug!("Fetching edition - date={}, slot={}", ymd, slot);
-    
-    let resp = client.get(&url).send().await
-        .with_context(|| format!("Request failed for {}", url))?;
+    let api_ed: ApiEdition = if let Some(api_path) = api_dir {
+        // Local file mode: read from {api_dir}/{YYYY-MM-DD}/{slot}.json
+        let file_path = std::path::Path::new(api_path).join(ymd).join(format!("{}.json", slot));
+        
+        debug!("Reading local edition file - path={}", file_path.display());
+        
+        if !file_path.exists() {
+            warn!("Edition file not found - {}", file_path.display());
+            return Ok(None);
+        }
+        
+        let content = std::fs::read_to_string(&file_path)
+            .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
+        
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse JSON from: {}", file_path.display()))?
+    } else {
+        // HTTP mode: fetch from API
+        let url = format!("https://news.awfulsec.com/api/{}/{}.json", ymd, slot);
+        debug!("Fetching edition - date={}, slot={}", ymd, slot);
+        
+        let resp = client.get(&url).send().await
+            .with_context(|| format!("Request failed for {}", url))?;
 
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        warn!("Edition not found (404) - {}/{}", ymd, slot);
-        return Ok(None);
-    }
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            warn!("Edition not found (404) - {}/{}", ymd, slot);
+            return Ok(None);
+        }
 
-    let resp = resp.error_for_status()
-        .with_context(|| format!("HTTP error for {}", url))?;
+        let resp = resp.error_for_status()
+            .with_context(|| format!("HTTP error for {}", url))?;
 
-    let api_ed: ApiEdition = resp.json().await
-        .with_context(|| format!("Decoding JSON for {}", url))?;
+        resp.json().await
+            .with_context(|| format!("Decoding JSON for {}", url))?
+    };
 
     // Use the parameters we requested, not the API's metadata (which may be incorrect)
     let edition_id = format!("{}-{}", ymd, slot);
@@ -62,6 +82,7 @@ pub async fn fetch_edition_opt(client: &Client, ymd: &str, slot: &str) -> Result
                 span: format!("{}..{}", t.approximateTimeFrameStart, t.approximateTimeFrameEnd),
                 context: t.descriptionOfWhyTimeFrameIsRelevant,
             }).collect(),
+            content: a.content,  // Preserve original article content
         }
     }).collect();
 

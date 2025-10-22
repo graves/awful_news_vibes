@@ -19,6 +19,8 @@ pub struct Article {
     pub named_entities: Vec<NamedEntity>,
     pub important_dates: Vec<DatedCtx>,
     pub important_timeframes: Vec<SpanCtx>,
+    #[serde(default)]
+    pub content: String,  // Original article content from API
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

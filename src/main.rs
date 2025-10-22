@@ -38,6 +38,11 @@ struct Args {
     /// Path to API config file for vibe summary/insights (use different LLM)
     #[arg(long)]
     vibe_config: Option<String>,
+    
+    /// Path to local API directory (optional) - if provided, reads JSON files from disk instead of fetching from HTTP
+    /// Expected structure: {api_dir}/{YYYY-MM-DD}/{slot}.json (e.g., ./api/2025-10-21/morning.json)
+    #[arg(long)]
+    api_dir: Option<String>,
 }
 
 
@@ -158,5 +163,16 @@ async fn main() -> Result<()> {
         cfg.clone()
     };
 
-    run_daily(&cfg, &cluster_cfg, &vibe_cfg, &tpl_cluster, &tpl_insights, &tpl_final, &ymd_yesterday, &ymd_today, &args.output_dir).await
+    run_daily(
+        &cfg, 
+        &cluster_cfg, 
+        &vibe_cfg, 
+        &tpl_cluster, 
+        &tpl_insights, 
+        &tpl_final, 
+        &ymd_yesterday, 
+        &ymd_today, 
+        &args.output_dir,
+        args.api_dir.as_deref(),
+    ).await
 }

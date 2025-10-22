@@ -33,6 +33,7 @@ pub async fn run_daily(
     ymd_yesterday: &str,
     ymd_today: &str,
     output_dir: &str,
+    api_dir: Option<&str>,
 ) -> Result<()> {
     let pipeline_start = std::time::Instant::now();
     info!("Pipeline started - date_range={} to {}", ymd_yesterday, ymd_today);
@@ -41,12 +42,19 @@ pub async fn run_daily(
 
     // 1) fetch editions: yesterday (morning, afternoon, evening), today (morning)
     let fetch_start = std::time::Instant::now();
+    
+    if let Some(api_path) = api_dir {
+        info!("Using local API directory: {}", api_path);
+    } else {
+        debug!("Fetching from HTTP API");
+    }
+    
     debug!("Fetching 4 editions: {}/{{morning,afternoon,evening}}, {}/morning", ymd_yesterday, ymd_today);
 
     let mut fetched = Vec::new();
 
     for slot in ["morning", "afternoon", "evening"] {
-        match fetch_edition_opt(&client, ymd_yesterday, slot).await? {
+        match fetch_edition_opt(&client, ymd_yesterday, slot, api_dir).await? {
             Some(ed) => {
                 debug!("Successfully fetched: {}/{}", ymd_yesterday, slot);
                 fetched.push(ed);
@@ -56,7 +64,7 @@ pub async fn run_daily(
             }
         }
     }
-    match fetch_edition_opt(&client, ymd_today, "morning").await? {
+    match fetch_edition_opt(&client, ymd_today, "morning", api_dir).await? {
         Some(ed) => {
             debug!("Successfully fetched: {}/morning", ymd_today);
             fetched.push(ed);
@@ -93,23 +101,19 @@ pub async fn run_daily(
     }
     debug!("Total article-edition pairs pooled: {}", pairs.len());
 
-    // 2.5) deduplicate by exact title *within the same edition* (do NOT erase cross-edition carryover)
+    // 2.5) deduplicate by article_id across all editions, keeping the LAST (most recent) occurrence
     let before = pairs.len();
-    use std::collections::HashSet;
-    let mut seen: HashSet<(String, String)> = HashSet::new(); // (title, edition_id)
-    pairs.retain(|(a, ed_id)| {
-        let key = (a.title.clone(), ed_id.clone());
-        if seen.contains(&key) {
-            false
-        } else {
-            seen.insert(key);
-            true
-        }
-    });
+    use std::collections::HashMap;
+    let mut latest: HashMap<String, (Article, String)> = HashMap::new();
+    for (a, ed_id) in pairs.into_iter() {
+        // Keep the last occurrence (most recent edition)
+        latest.insert(a.id.clone(), (a, ed_id));
+    }
+    pairs = latest.into_iter().map(|(_, pair)| pair).collect();
     let after = pairs.len();
     let removed = before - after;
     if removed > 0 {
-        info!("Deduplication - removed={} duplicates, retained={} unique articles", removed, after);
+        info!("Deduplication - removed={} duplicate articles across editions, retained={} unique articles", removed, after);
     } else {
         debug!("Deduplication - no duplicates found, retained={} articles", after);
     }
@@ -339,11 +343,12 @@ pub async fn run_daily(
         format!("{}-{}", ymd_today, "morning"),
     ];
 
-    // Emit D3-ready visual JSONs
+    // Emit D3-ready visual JSONs (pass articles for word cloud generation)
     write_all_viz(
         &date_dir,
         ymd_today,
         &clusters,
+        &articles,  // Pass articles for word cloud generation from original content
         &insights_json,
         &editions_ordered,
     )?;

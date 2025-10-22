@@ -10,7 +10,7 @@ use std::{
 };
 use url::Url;
 
-use crate::models::{ClusterMember, StoryCluster};
+use crate::models::{Article, ClusterMember, StoryCluster};
 use crate::out_models::MetaInsights;
 
 /* -------------------------------------------------------------------------- */
@@ -22,8 +22,27 @@ pub fn write_all_viz(
     out_dir_for_date: &Path, // e.g., out/2025-10-28
     date: &str,              // "YYYY-MM-DD" (anchor 'today')
     clusters: &[StoryCluster],
+    articles: &[Article],    // All articles for word cloud generation from original content
     insights_json: &str,
     editions: &[String], // ordered editions used this run
+) -> Result<()> {
+    write_all_viz_internal(out_dir_for_date, date, clusters, articles, insights_json, editions)?;
+    
+    // Update the root-level index.json
+    if let Some(root_dir) = out_dir_for_date.parent() {
+        update_root_index(root_dir, date)?;
+    }
+    
+    Ok(())
+}
+
+fn write_all_viz_internal(
+    out_dir_for_date: &Path,
+    date: &str,
+    clusters: &[StoryCluster],
+    articles: &[Article],
+    insights_json: &str,
+    editions: &[String],
 ) -> Result<()> {
     fs::create_dir_all(out_dir_for_date).with_context(|| format!("create {:?}", out_dir_for_date))?;
 
@@ -35,28 +54,28 @@ pub fn write_all_viz(
     let momentum = build_momentum(&lifecycles);
     write_json(out_dir_for_date.join("viz.momentum.json"), &momentum)?;
 
-    // 3) Narrative Divergence (heuristic from digest text)
-    let divergence = build_divergence(clusters);
+    // 3) Narrative Divergence (from original article content per outlet)
+    let divergence = build_divergence(clusters, articles);
     write_json(out_dir_for_date.join("viz.divergence.json"), &divergence)?;
 
-    // 4) Emotion Weather (aggregate from digests per edition presence)
-    let emotion = build_emotion(clusters, editions);
+    // 4) Emotion Weather (from original article content per edition)
+    let emotion = build_emotion(clusters, articles, editions);
     write_json(out_dir_for_date.join("viz.emotion.json"), &emotion)?;
 
-    // 5) Meta-Topic Compass (heuristic quadrant + weight, normalized vectors, raw scores)
-    let compass = build_compass(clusters);
+    // 5) Meta-Topic Compass (from original article content)
+    let compass = build_compass(clusters, articles);
     write_json(out_dir_for_date.join("viz.compass.json"), &compass)?;
 
     // 6) Silences (surface from insights.json if present)
     let silences = build_silences(insights_json);
     write_json(out_dir_for_date.join("viz.silences.json"), &silences)?;
 
-    // 7) Word Clouds (cleaned tokens; per-outlet + per-cluster)
-    let clouds = build_clouds(clusters);
+    // 7) Word Clouds (cleaned tokens; per-outlet + per-cluster) - NOW FROM ORIGINAL CONTENT
+    let clouds = build_clouds(clusters, articles);
     write_json(out_dir_for_date.join("viz.clouds.json"), &clouds)?;
 
-    // 8) Narrative Fingerprints (radial 0..1 features)
-    let fingerprints = build_fingerprints(clusters);
+    // 8) Narrative Fingerprints (from original article content)
+    let fingerprints = build_fingerprints(clusters, articles);
     write_json(out_dir_for_date.join("viz.fingerprints.json"), &fingerprints)?;
 
     // 9) Cartogram stub / Entities graph / Influence stub
@@ -160,13 +179,12 @@ fn classify_lifecycle(vol: &[u32], pres: &[u8]) -> String {
     let peak = *vol.iter().max().unwrap_or(&0);
     let duration = pres.iter().filter(|&&x| x == 1).count();
     
-    // Must meet minimum importance threshold first
+    // Minimum importance threshold
     if total < 4 && peak < 3 && duration < 3 {
-        return "steady".into(); // default for low-importance stories
+        return "steady".into();
     }
     
-    // Flashstorm: brief intense spike
-    // Peak ≥3 in single edition, duration ≤2, most volume concentrated
+    // Flashstorm: brief intense spike (≥60% of volume in peak edition)
     if peak >= 3 && duration <= 2 {
         let peak_idx = vol.iter().position(|&v| v == peak).unwrap_or(0);
         let peak_concentration = vol[peak_idx] as f32 / total as f32;
@@ -181,13 +199,11 @@ fn classify_lifecycle(vol: &[u32], pres: &[u8]) -> String {
     }
     
     // Wildfire: growing story with sustained attention
-    // Peak ≥2, appears in ≥3 editions, has actual growth pattern
     if peak >= 2 && duration >= 3 && has_growth_pattern(vol) {
         return "wildfire".into();
     }
     
     // Slow freeze: declining story
-    // Starts with ≥2, declines over ≥3 editions
     if duration >= 3 && has_decline_pattern(vol) {
         let first_nonzero = vol.iter().find(|&&x| x > 0).copied().unwrap_or(0);
         if first_nonzero >= 2 {
@@ -195,41 +211,35 @@ fn classify_lifecycle(vol: &[u32], pres: &[u8]) -> String {
         }
     }
     
-    // Steady: consistent coverage
     "steady".into()
 }
 
 fn has_growth_pattern(vol: &[u32]) -> bool {
-    // True growth: later editions have MORE articles than early ones
-    // Not just "no decreases" but actual increases
-    
     let nonzero: Vec<u32> = vol.iter().copied().filter(|&x| x > 0).collect();
     if nonzero.len() < 2 {
         return false;
     }
     
-    // Check if last half has higher average than first half
+    // Later editions must have 20% more average than early editions
     let mid = nonzero.len() / 2;
     let early_avg: f32 = nonzero[..mid].iter().sum::<u32>() as f32 / mid as f32;
     let late_avg: f32 = nonzero[mid..].iter().sum::<u32>() as f32 / (nonzero.len() - mid) as f32;
     
-    late_avg > early_avg * 1.2 // Must be 20% higher
+    late_avg > early_avg * 1.2
 }
 
 fn has_decline_pattern(vol: &[u32]) -> bool {
-    // True decline: earlier editions have MORE articles than later ones
-    
     let nonzero: Vec<u32> = vol.iter().copied().filter(|&x| x > 0).collect();
     if nonzero.len() < 2 {
         return false;
     }
     
-    // Check if first half has higher average than last half
+    // Earlier editions must have 20% more average than later editions
     let mid = nonzero.len() / 2;
     let early_avg: f32 = nonzero[..mid].iter().sum::<u32>() as f32 / mid as f32;
     let late_avg: f32 = nonzero[mid..].iter().sum::<u32>() as f32 / (nonzero.len() - mid) as f32;
     
-    early_avg > late_avg * 1.2 // Must be 20% higher
+    early_avg > late_avg * 1.2
 }
 
 fn has_resurrection(pres: &[u8]) -> bool {
@@ -319,9 +329,9 @@ struct VDivPoint {
     outlet: String,
     x: f32,
     y: f32,
-    /// Signed polarity: speculation (+) vs certainty (−)
+    /// Signed polarity: -1 (certain/definitive) to +1 (speculative/unconfirmed)
     certainty: f32,
-    /// Convenience magnitude in 0..1 (0 speculative … 1 certain)
+    /// Normalized to 0..1 where 0=certain, 1=speculative (inverse for compatibility)
     certainty01: f32,
 }
 #[derive(Serialize)]
@@ -336,23 +346,40 @@ struct VDivBundle {
     clusters: Vec<VDivCluster>,
 }
 
-fn build_divergence(clusters: &[StoryCluster]) -> VDivBundle {
+fn build_divergence(clusters: &[StoryCluster], articles: &[Article]) -> VDivBundle {
+    // Build article lookup
+    let article_map: HashMap<String, &Article> = articles.iter()
+        .map(|a| (a.id.clone(), a))
+        .collect();
+    
     let mut out = Vec::new();
     for c in clusters {
-        let outlets = unique_outlets(&c.members);
+        // Collect article content per outlet
+        let mut outlet_content: HashMap<String, String> = HashMap::new();
+        
+        for member in &c.members {
+            if let Some(article) = article_map.get(&member.article_id) {
+                if !article.content.is_empty() {
+                    let outlet = outlet_from_source(&member.source);
+                    outlet_content.entry(outlet.clone()).or_default().push_str(&article.content);
+                    outlet_content.get_mut(&outlet).unwrap().push(' ');
+                }
+            }
+        }
+        
         let mut points = Vec::new();
-        // NOTE: we still use cluster-level digest for all outlets (member-level text may not be available here).
-        for o in outlets {
-            let (x, y, c_pol) = stance_from_text(&c.digest_abridged);
+        for (outlet, content) in outlet_content {
+            let (x, y, c_pol) = stance_from_text(&content);
             let c_mag = ((c_pol + 1.0) / 2.0).clamp(0.0, 1.0);
             points.push(VDivPoint {
-                outlet: o,
+                outlet,
                 x,
                 y,
-                certainty: c_pol,   // + = speculation, − = certainty (see doc above)
-                certainty01: c_mag, // 0..1 magnitude where 1 ~ certain
+                certainty: c_pol,
+                certainty01: c_mag,
             });
         }
+        
         out.push(VDivCluster {
             id: c.cluster_id.clone(),
             title: c.canonical_title.clone(),
@@ -363,7 +390,7 @@ fn build_divergence(clusters: &[StoryCluster]) -> VDivBundle {
         axes: vec![
             "blame→cause".into(),
             "risk→optimism".into(),
-            "speculation→certainty".into(),
+            "certain→speculative".into(),
         ],
         clusters: out,
     }
@@ -385,14 +412,30 @@ struct VEmotion {
     top_examples: HashMap<String, Vec<String>>,
 }
 
-fn build_emotion(clusters: &[StoryCluster], editions: &[String]) -> VEmotion {
+fn build_emotion(clusters: &[StoryCluster], articles: &[Article], editions: &[String]) -> VEmotion {
+    // Build article lookup
+    let article_map: HashMap<String, &Article> = articles.iter()
+        .map(|a| (a.id.clone(), a))
+        .collect();
+    
     // accumulate per edition
     let mut per_edition_scores: Vec<[f32; 4]> = vec![[0.0; 4]; editions.len()];
-    let mut tops: HashMap<String, Vec<(String, f32)>> = HashMap::new(); // theme -> (cluster_id, score)
+    let mut tops: HashMap<String, Vec<(String, f32)>> = HashMap::new();
     let date_to_idxs = build_date_to_idxs(editions);
 
     for c in clusters {
-        let (anx, opt, pan, amb) = emotion_from_text(&c.digest_abridged);
+        // Collect article content for this cluster
+        let mut cluster_content = String::new();
+        for member in &c.members {
+            if let Some(article) = article_map.get(&member.article_id) {
+                if !article.content.is_empty() {
+                    cluster_content.push_str(&article.content);
+                    cluster_content.push(' ');
+                }
+            }
+        }
+        
+        let (anx, opt, pan, amb) = emotion_from_text(&cluster_content);
 
         // Use precomputed mapping for efficiency
         let mut ed_idxs = edition_indices_for_cluster_with_idx(&c.members, editions, &date_to_idxs);
@@ -471,13 +514,31 @@ struct VCompass {
     centroid: Option<[f32; 2]>,
 }
 
-fn build_compass(clusters: &[StoryCluster]) -> VCompass {
+fn build_compass(clusters: &[StoryCluster], articles: &[Article]) -> VCompass {
+    // Build article lookup
+    let article_map: HashMap<String, &Article> = articles.iter()
+        .map(|a| (a.id.clone(), a))
+        .collect();
+    
     let mut out = Vec::new();
     let mut sum: [f32; 2] = [0.0, 0.0];
     let mut n = 0.0;
 
     for c in clusters {
-        let (quad, vx, vy, scores) = compass_from_text(&c.digest_abridged);
+        // Collect article content for this cluster
+        let mut cluster_content = String::new();
+        for member in &c.members {
+            if let Some(article) = article_map.get(&member.article_id) {
+                if !article.content.is_empty() {
+                    cluster_content.push_str(&article.content);
+                    cluster_content.push(' ');
+                }
+            }
+        }
+        
+        // Enhanced: pass entities to boost category scores
+        let entity_names: Vec<String> = c.entities.iter().cloned().collect();
+        let (quad, vx, vy, scores) = compass_from_text_enhanced(&cluster_content, &entity_names);
 
         // Weight = attention mass (size × span), lightly compressed (sqrt) and scaled.
         let members = c.members.len() as f32;
@@ -534,7 +595,7 @@ fn build_silences(insights_json: &str) -> VSilences {
 }
 
 /* -------------------------------------------------------------------------- */
-/* 7) Word Clouds (CLEANED)                                                   */
+/* 7) Word Clouds (CLEANED + FIXED multi-counting)                           */
 /* -------------------------------------------------------------------------- */
 
 #[derive(Serialize)]
@@ -548,37 +609,51 @@ struct VClouds {
     by_cluster: HashMap<String, Vec<(String, u32)>>,
 }
 
-fn build_clouds(clusters: &[StoryCluster]) -> VClouds {
-    // Aggregate cluster-level tokens (cleaned, outlet-agnostic)
+fn build_clouds(clusters: &[StoryCluster], articles: &[Article]) -> VClouds {
+    // Build article lookup by ID
+    let article_map: HashMap<String, &Article> = articles.iter()
+        .map(|a| (a.id.clone(), a))
+        .collect();
+
+    // Aggregate cluster-level tokens from ORIGINAL CONTENT
     let mut cluster_tokens: HashMap<String, Vec<(String, u32)>> = HashMap::new();
 
-    // For outlets, we recompute per outlet with outlet-specific stopwords so brand/etc. is removed.
-    let mut outlet_tokens: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    // For outlets: collect original article content per outlet
+    let mut outlet_article_content: HashMap<String, Vec<String>> = HashMap::new();
 
     for c in clusters {
-        // by-cluster tokens (use a generic stop set; no outlet brand removal here)
-        let toks_cluster = top_tokens_clean(&c.digest_abridged, None, 30);
-        cluster_tokens.insert(c.cluster_id.clone(), toks_cluster.clone());
-
-        // per-outlet aggregation with outlet-aware cleaning
-        let outlets = unique_outlets(&c.members);
-        for o in outlets {
-            let entry = outlet_tokens.entry(o.clone()).or_default();
-            let toks_outlet = top_tokens_clean(&c.digest_abridged, Some(&o), 30);
-            for (t, w) in toks_outlet {
-                *entry.entry(t).or_insert(0) += w;
+        // Collect all article content for this cluster
+        let mut cluster_content = String::new();
+        
+        for member in &c.members {
+            if let Some(article) = article_map.get(&member.article_id) {
+                if !article.content.is_empty() {
+                    cluster_content.push_str(&article.content);
+                    cluster_content.push(' ');
+                    
+                    // Also track per-outlet
+                    let outlet = outlet_from_source(&member.source);
+                    outlet_article_content.entry(outlet).or_default().push(article.content.clone());
+                }
             }
         }
+        
+        // by-cluster tokens from ORIGINAL CONTENT
+        let toks_cluster = top_tokens_clean(&cluster_content, None, 30);
+        cluster_tokens.insert(c.cluster_id.clone(), toks_cluster);
     }
 
+    // Now tokenize per-outlet with all their article content
     let mut by_outlet = Vec::new();
-    for (o, m) in outlet_tokens {
-        let mut v: Vec<(String, u32)> = m.into_iter().collect();
-        v.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
-        // Enforce diversity: avoid repeated stems dominating (very light heuristic)
-        dedupe_by_stem(&mut v);
-        v.truncate(60);
-        by_outlet.push(VCloudByOutlet { outlet: o, tokens: v });
+    for (outlet, contents) in outlet_article_content {
+        let combined_content = contents.join(" ");
+        let mut toks = top_tokens_clean(&combined_content, Some(&outlet), 60);
+        
+        // Enforce diversity: avoid repeated stems dominating
+        dedupe_by_stem(&mut toks);
+        toks.truncate(60);
+        
+        by_outlet.push(VCloudByOutlet { outlet, tokens: toks });
     }
 
     VClouds { by_outlet, by_cluster: cluster_tokens }
@@ -599,10 +674,26 @@ struct VFingerprints {
     clusters: Vec<VFingerprint>,
 }
 
-fn build_fingerprints(clusters: &[StoryCluster]) -> VFingerprints {
+fn build_fingerprints(clusters: &[StoryCluster], articles: &[Article]) -> VFingerprints {
+    // Build article lookup
+    let article_map: HashMap<String, &Article> = articles.iter()
+        .map(|a| (a.id.clone(), a))
+        .collect();
+    
     let mut out = Vec::new();
     for c in clusters {
-        let (risk, optimism, blame, cause, certainty) = fingerprint_from_text(&c.digest_abridged);
+        // Collect article content for this cluster
+        let mut cluster_content = String::new();
+        for member in &c.members {
+            if let Some(article) = article_map.get(&member.article_id) {
+                if !article.content.is_empty() {
+                    cluster_content.push_str(&article.content);
+                    cluster_content.push(' ');
+                }
+            }
+        }
+        
+        let (risk, optimism, blame, cause, certainty) = fingerprint_from_text(&cluster_content);
         let mut radial = HashMap::new();
         radial.insert("risk".into(), risk);
         radial.insert("optimism".into(), optimism);
@@ -785,12 +876,6 @@ fn edition_indices_for_cluster_with_idx(
     s.into_iter().collect()
 }
 
-/// Backward-compatible version that constructs its own date index (kept for other call sites).
-fn edition_indices_for_cluster(members: &[ClusterMember], editions: &[String]) -> Vec<usize> {
-    let date_to_idxs = build_date_to_idxs(editions);
-    edition_indices_for_cluster_with_idx(members, editions, &date_to_idxs)
-}
-
 fn column_maxes(v: &[[f32; 4]]) -> [f32; 4] {
     let mut maxes = [0.0; 4];
     for row in v {
@@ -809,178 +894,286 @@ fn push_top(map: &mut HashMap<String, Vec<(String, f32)>>, key: &str, id: String
 
 /* ------------------ lightweight keyword heuristics over text --------------- */
 
+/* ------------------ Improved keyword heuristics over text ------------------ */
+
 fn stance_from_text(txt: &str) -> (f32, f32, f32) {
-    // (x, y, certainty_polarity) with boundary-aware counting + smoothing
     let t = txt.to_lowercase();
 
-    // blame vs cause
-    let blame = count_tokens(&t, &["blame", "fault", "accuse", "responsible"]);
-    let cause = count_tokens(&t, &["cause", "drivers"])
-        + count_phrases(&t, &["due to", "because of"]);
+    // Blame: Attribution of fault/wrongdoing (added: guilty, liable, scapegoat, faulted)
+    let blame = count_tokens(&t, &[
+        "blame", "blamed", "blames", "blaming",
+        "fault", "faulted",
+        "accuse", "accused", "accusation",
+        "guilty",
+        "liable",
+        "scapegoat", "scapegoating",
+    ]) + count_phrases(&t, &["at fault", "to blame for"]);
+    
+    // Cause: Causal explanation/analysis (added: reason, underlying, trigger, contribute, root cause)
+    let cause = count_tokens(&t, &[
+        "cause", "causes", "caused", "causing",
+        "driver", "drivers", "driving",
+        "factor", "factors",
+        "reason", "reasons",
+        "trigger", "triggered", "triggers",
+        "contribute", "contributed", "contributes",
+        "underlying",
+        "lead", "led", "leading",
+    ]) + count_phrases(&t, &["due to", "because of", "result of", "stems from", "root cause", "leads to"]);
 
-    // risk vs optimism
-    let risk = count_tokens(&t, &["risk", "threat", "concern", "uncertain", "volatile", "danger"]);
-    let prog =
-        count_tokens(&t, &["progress", "improved", "optimistic", "advance", "breakthrough", "recovery"]);
+    // Risk: Threat/danger/uncertainty (added: hazard, vulnerable, peril, exposed)
+    let risk = count_tokens(&t, &[
+        "risk", "risks", "risky",
+        "threat", "threats", "threaten", "threatening",
+        "concern", "concerns", "concerned", "concerning",
+        "uncertain", "uncertainty",
+        "volatile", "volatility",
+        "danger", "dangers", "dangerous",
+        "hazard", "hazards", "hazardous",
+        "vulnerable", "vulnerability",
+        "peril", "perilous",
+        "jeopardy",
+        "exposed", "exposure",
+    ]) + count_phrases(&t, &["at risk"]);
+    
+    // Optimism/Progress: Positive outlook/improvement (added: promising, encouraging, gains, success, upbeat)
+    let prog = count_tokens(&t, &[
+        "progress", "progressing",
+        "improved", "improvement", "improving", "improves",
+        "optimistic", "optimism",
+        "advance", "advances", "advancing", "advanced",
+        "breakthrough", "breakthroughs",
+        "recovery", "recovering", "recovered",
+        "positive", "positively",
+        "promising",
+        "encouraged", "encouraging",
+        "gains", "gain", "gained",
+        "success", "successful", "successfully",
+        "better",
+        "upbeat",
+        "turnaround",
+    ]);
 
-    // certainty vs speculation
-    let certain = count_tokens(&t, &["confirmed", "official", "definitive", "certified"]);
-    let spec = count_tokens(&t, &["speculation", "rumors", "unconfirmed", "alleged"]);
+    // Certainty: Definitive/confirmed statements (added: proven, established, documented, validated)
+    let certain = count_tokens(&t, &[
+        "confirmed", "confirms", "confirm",
+        "official", "officially",
+        "definitive", "definitively",
+        "certified",
+        "verified", "verify",
+        "proven", "proof",
+        "established",
+        "documented",
+        "validated", "validation",
+        "conclusive",
+    ]) + count_phrases(&t, &["evidence shows"]);
+    
+    // Speculation: Unconfirmed/hedged statements (added: claims, suggest, may/might/could, possibly, believed)
+    let spec = count_tokens(&t, &[
+        "speculation", "speculate", "speculative",
+        "rumors", "rumor", "rumored",
+        "unconfirmed",
+        "alleged", "allegedly", "allegation",
+        "reportedly",
+        "claim", "claims", "claimed",
+        "suggest", "suggests", "suggested",
+        "may", "might", "could",
+        "possibly", "possible",
+        "potential", "potentially",
+        "believed",
+        "appears",
+    ]) + count_phrases(&t, &["sources say", "unnamed sources", "believed to", "appears to"]);
 
-    let x = norm_smooth(blame as f32, cause as f32); // blame vs cause (-1..1)
-    let y = norm_smooth(risk as f32, prog as f32);   // risk vs optimism (-1..1)
-    let c = norm_smooth(certain as f32, spec as f32); // certainty vs speculation (-1..1)
+    let x = norm_smooth(blame as f32, cause as f32);
+    let y = norm_smooth(risk as f32, prog as f32);
+    let c = norm_smooth(certain as f32, spec as f32);
 
     (x, y, c)
 }
 
 fn emotion_from_text(txt: &str) -> (f32, f32, f32, f32) {
     let t = txt.to_lowercase();
-    let anxiety = count_tokens(&t, &["fear", "worry", "anxiety", "turmoil", "instability"]) as f32;
-    let optimism = count_tokens(&t, &["optimism", "hope", "progress", "recovery", "breakthrough"]) as f32;
-    let panic = count_tokens(&t, &["panic", "crisis", "emergency", "collapse"]) as f32;
-    let ambiguity = count_tokens(&t, &["unclear", "uncertain", "ambiguous", "conflicting"]) as f32;
-    (anxiety, optimism, panic, ambiguity)
+    
+    // Anxiety: General fear/worry (added: nervous, uneasy, tense, alarm, dread)
+    let anxiety = count_tokens(&t, &[
+        "fear", "fears", "feared", "fearful",
+        "worry", "worried", "worries", "worrying",
+        "anxiety", "anxious",
+        "turmoil",
+        "instability", "unstable",
+        "nervous", "nervously",
+        "uneasy", "unease",
+        "tense", "tension",
+        "alarm", "alarmed", "alarming",
+        "dread", "dreaded",
+    ]) as f32;
+    
+    // Optimism: Positive outlook (already comprehensive, added: hopeful, encouraged, uplifting)
+    let optimism = count_tokens(&t, &[
+        "optimism", "optimistic",
+        "hope", "hopeful", "hoping",
+        "progress", "progressing",
+        "recovery", "recovering",
+        "breakthrough", "breakthroughs",
+        "positive", "positively",
+        "encouraged", "encouraging",
+        "promising",
+        "uplifting",
+    ]) as f32;
+    
+    // Panic: Acute crisis/emergency (added: chaos, catastrophe, disaster, dire, urgent)
+    let panic = count_tokens(&t, &[
+        "panic", "panicked", "panicking",
+        "crisis",
+        "emergency", "emergencies",
+        "collapse", "collapsed", "collapsing",
+        "chaos", "chaotic",
+        "catastrophe", "catastrophic",
+        "disaster", "disastrous",
+        "urgent", "urgently", "urgency",
+        "dire",
+        "critical",
+    ]) as f32;
+    
+    // Ambiguity: Confusion/contradiction (added: confusion, disputed, mixed, questioned)
+    let ambiguity = count_tokens(&t, &[
+        "unclear",
+        "uncertain", "uncertainty",
+        "ambiguous", "ambiguity",
+        "conflicting",
+        "contradictory", "contradiction", "contradicts",
+        "confusion", "confused", "confusing",
+        "disputed", "dispute", "disputes",
+        "debated", "debate",
+        "questioned", "questioning",
+    ]) + count_phrases(&t, &["mixed signals"]) as usize;
+    
+    (anxiety, optimism, panic, ambiguity as f32)
 }
 
-// Returns (quad, vx, vy, scores)
-//  - vx = (structural - human) / sum
-//  - vy = (conflict  - future) / sum
-// where sum = structural + conflict + human + future (if sum==0 → vector [0,0]).
-fn compass_from_text(txt: &str) -> (String, f32, f32, HashMap<String, f32>) {
+/// Enhanced compass analysis with weighted keywords and entity boosting
+fn compass_from_text_enhanced(txt: &str, entities: &[String]) -> (String, f32, f32, HashMap<String, f32>) {
     let t = txt.to_lowercase();
-
-    // Balanced keyword sets.
-    // Structural: institutions, policy, budgets, courts, sanctions, trade, climate (structural angle).
-    let structural = count_tokens(
-        &t,
-        &[
-            "policy",
-            "policies",
-            "economy",
-            "budget",
-            "budgets",
-            "institution",
-            "institutions",
-            "regulation",
-            "regulations",
-            "law",
-            "laws",
-            "tax",
-            "taxes",
-            "welfare",
-            "infrastructure",
-            "agency",
-            "agencies",
-            "court",
-            "courts",
-            "legislation",
-            "congress",
-            "parliament",
-            "administration",
-            "sanction",
-            "sanctions",
-            "tariff",
-            "tariffs",
-            "trade",
-            "climate",
-            "emissions",
-            "carbon",
-        ],
-    ) as f32;
-
-    // Conflict: war/violence/legal fights/protests/escalations.
-    let conflict = count_tokens(
-        &t,
-        &[
-            "war",
-            "conflict",
-            "clashes",
-            "attack",
-            "attacks",
-            "strike",
-            "strikes",
-            "missile",
-            "bomb",
-            "bombing",
-            "battle",
-            "battles",
-            "riot",
-            "riots",
-            "protest",
-            "protests",
-            "arrest",
-            "arrests",
-            "indict",
-            "indicted",
-            "charges",
-            "trial",
-            "ceasefire",
-            "tensions",
-            "crackdown",
-            "shooting",
-            "shootings",
-        ],
-    ) as f32;
-
-    // Human: social/people-centered content.
-    let human = count_tokens(
-        &t,
-        &[
-            "health",
-            "culture",
-            "identity",
-            "education",
-            "family",
-            "victims",
-            "workers",
-            "students",
-            "women",
-            "children",
-            "community",
-            "refugees",
-            "migrants",
-            "rights",
-            "deaths",
-            "injured",
-            "mental",
-            "care",
-        ],
-    ) as f32;
-
-    // Future: genuinely forward-looking; removed "climate" to reduce skew.
-    let future = count_tokens(
-        &t,
-        &[
-            "technology",
-            "ai",
-            "innovation",
-            "research",
-            "forecast",
-            "forecasts",
-            "projection",
-            "projections",
-            "plan",
-            "plans",
-            "roadmap",
-            "prototype",
-            "pilot",
-            "next",
-            "upcoming",
-            "future",
-            "launch",
-            "launches",
-        ],
-    ) as f32;
-
+    
+    // Define weighted keywords - stronger signals get higher multipliers
+    struct WeightedKeywords {
+        words: Vec<&'static str>,
+        weight: f32,
+    }
+    
+    // STRUCTURAL - weighted by signal strength
+    let structural_keywords = vec![
+        WeightedKeywords { words: vec!["policy", "policies", "law", "laws", "legislation", "regulation"], weight: 2.5 },
+        WeightedKeywords { words: vec!["economy", "economic", "fiscal", "monetary", "budget"], weight: 2.0 },
+        WeightedKeywords { words: vec!["government", "administration", "parliament", "congress", "senate"], weight: 1.8 },
+        WeightedKeywords { words: vec!["institution", "institutions", "agency", "agencies", "ministry"], weight: 1.5 },
+        WeightedKeywords { words: vec!["court", "courts", "legal", "judicial"], weight: 1.5 },
+        WeightedKeywords { words: vec!["tax", "taxes", "taxation", "tariff", "tariffs", "trade", "sanction", "sanctions"], weight: 1.3 },
+        WeightedKeywords { words: vec!["reform", "reforms", "governance", "infrastructure", "spending", "welfare"], weight: 1.0 },
+    ];
+    
+    // CONFLICT - weighted by intensity
+    let conflict_keywords = vec![
+        WeightedKeywords { words: vec!["war", "wars", "warfare", "combat"], weight: 3.0 },
+        WeightedKeywords { words: vec!["attack", "attacks", "bomb", "bombs", "bombing", "missile", "missiles"], weight: 2.8 },
+        WeightedKeywords { words: vec!["violence", "violent", "assault", "assaults", "shooting"], weight: 2.5 },
+        WeightedKeywords { words: vec!["battle", "battles", "fighting", "fought", "strike", "strikes"], weight: 2.3 },
+        WeightedKeywords { words: vec!["conflict", "conflicts", "clash", "clashes", "hostilities"], weight: 2.0 },
+        WeightedKeywords { words: vec!["protest", "protests", "riot", "riots", "crackdown"], weight: 1.8 },
+        WeightedKeywords { words: vec!["arrest", "arrests", "charges", "charged", "trial", "indict"], weight: 1.5 },
+        WeightedKeywords { words: vec!["tensions", "confrontation", "ceasefire", "aggression"], weight: 1.0 },
+    ];
+    
+    // HUMAN - weighted by impact
+    let human_keywords = vec![
+        WeightedKeywords { words: vec!["deaths", "died", "dead", "casualties", "killed"], weight: 3.0 },
+        WeightedKeywords { words: vec!["suffering", "trauma", "traumatic", "victims"], weight: 2.5 },
+        WeightedKeywords { words: vec!["displaced", "refugees", "humanitarian", "survivors"], weight: 2.3 },
+        WeightedKeywords { words: vec!["injured", "injuries", "wounded", "harm"], weight: 2.0 },
+        WeightedKeywords { words: vec!["health", "healthcare", "medical", "mental"], weight: 1.8 },
+        WeightedKeywords { words: vec!["children", "families", "women", "community", "communities"], weight: 1.5 },
+        WeightedKeywords { words: vec!["poverty", "hunger", "rights", "education", "workers"], weight: 1.3 },
+        WeightedKeywords { words: vec!["culture", "identity", "social", "care", "lives"], weight: 1.0 },
+    ];
+    
+    // FUTURE - weighted by forward-looking nature
+    let future_keywords = vec![
+        WeightedKeywords { words: vec!["climate", "emissions", "carbon", "environmental"], weight: 2.5 },
+        WeightedKeywords { words: vec!["ai", "artificial", "technology", "technologies", "innovation"], weight: 2.3 },
+        WeightedKeywords { words: vec!["emerging", "transformation", "transition", "evolving"], weight: 2.0 },
+        WeightedKeywords { words: vec!["forecast", "projection", "trend", "trends", "outlook"], weight: 1.8 },
+        WeightedKeywords { words: vec!["strategy", "strategic", "vision", "plan", "planning"], weight: 1.5 },
+        WeightedKeywords { words: vec!["research", "development", "launch", "prototype"], weight: 1.3 },
+        WeightedKeywords { words: vec!["future", "next", "upcoming", "potential"], weight: 0.8 },
+    ];
+    
+    // Count with weights
+    let mut structural = 0.0f32;
+    for wk in &structural_keywords {
+        structural += count_tokens(&t, &wk.words) as f32 * wk.weight;
+    }
+    
+    let mut conflict = 0.0f32;
+    for wk in &conflict_keywords {
+        conflict += count_tokens(&t, &wk.words) as f32 * wk.weight;
+    }
+    
+    let mut human = 0.0f32;
+    for wk in &human_keywords {
+        human += count_tokens(&t, &wk.words) as f32 * wk.weight;
+    }
+    
+    let mut future = 0.0f32;
+    for wk in &future_keywords {
+        future += count_tokens(&t, &wk.words) as f32 * wk.weight;
+    }
+    
+    // Entity-based boosting (entities provide strong categorical signals)
+    for entity in entities {
+        let e = entity.to_lowercase();
+        
+        // Government/institutional entities → structural boost
+        if e.contains("government") || e.contains("ministry") || e.contains("department") 
+            || e.contains("agency") || e.contains("parliament") || e.contains("senate")
+            || e.contains("congress") || e.contains("court") || e.contains("federal")
+            || e.contains("central bank") || e.contains("reserve") {
+            structural += 5.0;
+        }
+        
+        // Military/conflict entities → conflict boost
+        if e.contains("military") || e.contains("army") || e.contains("forces")
+            || e.contains("defense") || e.contains("pentagon") || e.contains("nato")
+            || e.contains("battalion") || e.contains("troops") || e.contains("militia")
+            || e.contains("hamas") || e.contains("hezbollah") || e.contains("taliban") {
+            conflict += 5.0;
+        }
+        
+        // Humanitarian/social entities → human boost
+        if e.contains("red cross") || e.contains("unicef") || e.contains("refugee")
+            || e.contains("hospital") || e.contains("victims") || e.contains("civilians")
+            || e.contains("community") || e.contains("humanitarian") || e.contains("ngo")
+            || e.contains("charity") || e.contains("relief") {
+            human += 5.0;
+        }
+        
+        // Tech/climate/innovation entities → future boost
+        if e.contains("tech") || e.contains("google") || e.contains("microsoft")
+            || e.contains("apple") || e.contains("amazon") || e.contains("meta")
+            || e.contains("openai") || e.contains("climate") || e.contains("renewable")
+            || e.contains("startup") || e.contains("innovation") || e.contains("research") {
+            future += 5.0;
+        }
+    }
+    
     let sum = structural + conflict + human + future;
     let (vx, vy) = if sum > 0.0 {
-        ((structural - human) / sum, (conflict - future) / sum)
+        // Negative = structural (left), Positive = human (right)
+        // Negative = conflict (bottom), Positive = future (top)
+        ((human - structural) / sum, (future - conflict) / sum)
     } else {
         (0.0, 0.0)
     };
 
-    // Choose quadrant by max score (stable tie-breaker via order below).
     let mut quad = "structural";
     let mut maxv = structural;
     if conflict > maxv {
@@ -996,7 +1189,182 @@ fn compass_from_text(txt: &str) -> (String, f32, f32, HashMap<String, f32>) {
     }
 
     let mut scores = HashMap::new();
-    // Expose *normalized* bucket shares so they sum to 1.0 when sum>0.
+    if sum > 0.0 {
+        scores.insert("structural".into(), structural / sum);
+        scores.insert("conflict".into(), conflict / sum);
+        scores.insert("human".into(), human / sum);
+        scores.insert("future".into(), future / sum);
+    } else {
+        scores.insert("structural".into(), 0.0);
+        scores.insert("conflict".into(), 0.0);
+        scores.insert("human".into(), 0.0);
+        scores.insert("future".into(), 0.0);
+    }
+
+    (quad.to_string(), vx, vy, scores)
+}
+
+/// Original unweighted compass function (kept for compatibility/fallback)
+fn compass_from_text(txt: &str) -> (String, f32, f32, HashMap<String, f32>) {
+    let t = txt.to_lowercase();
+
+    // Structural: Institutions/policy/systems (added: reform, governance, fiscal, systemic, ministry)
+    let structural = count_tokens(
+        &t,
+        &[
+            "policy", "policies",
+            "economy", "economic",
+            "budget", "budgets", "budgetary",
+            "institution", "institutions", "institutional",
+            "regulation", "regulations", "regulatory",
+            "law", "laws", "legal",
+            "tax", "taxes", "taxation",
+            "welfare",
+            "infrastructure",
+            "agency", "agencies",
+            "court", "courts",
+            "legislation", "legislative",
+            "congress", "congressional",
+            "parliament", "parliamentary",
+            "administration",
+            "sanction", "sanctions",
+            "tariff", "tariffs",
+            "trade", "trading",
+            "reform", "reforms",
+            "governance",
+            "fiscal",
+            "monetary",
+            "systemic",
+            "ministry", "ministries",
+            "senate",
+            "spending",
+        ],
+    ) as f32;
+
+    // Conflict: Violence/confrontation/legal battles (added: violence, combat, fighting, raid, assault, hostilities)
+    let conflict = count_tokens(
+        &t,
+        &[
+            "war", "wars", "warfare",
+            "conflict", "conflicts",
+            "clash", "clashes", "clashing",
+            "attack", "attacks", "attacked", "attacking",
+            "strike", "strikes", "striking",
+            "missile", "missiles",
+            "bomb", "bombs", "bombing", "bombed",
+            "battle", "battles",
+            "riot", "riots", "rioting",
+            "protest", "protests", "protesting",
+            "arrest", "arrests", "arrested",
+            "indict", "indicted", "indictment",
+            "charges", "charged",
+            "trial", "trials",
+            "ceasefire",
+            "tensions",
+            "crackdown",
+            "shooting", "shootings", "shot",
+            "violence", "violent", "violently",
+            "combat",
+            "confrontation", "confront",
+            "fighting", "fought",
+            "raid", "raids", "raided",
+            "assault", "assaults", "assaulted",
+            "hostilities",
+            "aggression", "aggressive",
+        ],
+    ) as f32;
+
+    // Human: People-centered/social impact (added: suffering, casualties, displaced, trauma, survivors, poverty)
+    let human = count_tokens(
+        &t,
+        &[
+            "health", "healthcare",
+            "culture", "cultural",
+            "identity",
+            "education", "educational",
+            "family", "families",
+            "victims",
+            "workers", "labor",
+            "students",
+            "women",
+            "children",
+            "community", "communities",
+            "refugees",
+            "migrants", "migration",
+            "rights",
+            "deaths", "died", "dead",
+            "injured", "injuries",
+            "mental",
+            "care", "caring",
+            "humanitarian",
+            "suffering",
+            "casualties",
+            "displaced", "displacement",
+            "trauma", "traumatic",
+            "survivors", "survived",
+            "lives",
+            "social",
+            "poverty",
+            "hunger", "hungry",
+        ],
+    ) as f32;
+
+    // Future: Forward-looking/planning/emerging trends (added: trend, outlook, strategy, emerging, transformation)
+    let future = count_tokens(
+        &t,
+        &[
+            "technology", "technologies", "technological",
+            "ai", "artificial",
+            "innovation", "innovative",
+            "research", "researching",
+            "forecast", "forecasts", "forecasting",
+            "projection", "projections", "projected",
+            "plan", "plans", "planning", "planned",
+            "roadmap",
+            "prototype", "prototypes",
+            "pilot",
+            "next",
+            "upcoming",
+            "future",
+            "launch", "launches", "launching",
+            "climate",
+            "emissions",
+            "carbon",
+            "trend", "trends", "trending",
+            "outlook",
+            "vision", "visionary",
+            "strategy", "strategic",
+            "development", "developing",
+            "evolving", "evolution",
+            "transformation", "transforming",
+            "transition", "transitioning",
+            "emerging",
+            "potential",
+        ],
+    ) as f32;
+
+    let sum = structural + conflict + human + future;
+    let (vx, vy) = if sum > 0.0 {
+        ((structural - human) / sum, (conflict - future) / sum)
+    } else {
+        (0.0, 0.0)
+    };
+
+    let mut quad = "structural";
+    let mut maxv = structural;
+    if conflict > maxv {
+        quad = "conflict";
+        maxv = conflict;
+    }
+    if human > maxv {
+        quad = "human";
+        maxv = human;
+    }
+    if future > maxv {
+        quad = "future";
+    }
+
+    let mut scores = HashMap::new();
     if sum > 0.0 {
         scores.insert("structural".into(), structural / sum);
         scores.insert("conflict".into(), conflict / sum);
@@ -1051,10 +1419,6 @@ fn top_tokens_clean(text: &str, outlet_host: Option<&str>, limit: usize) -> Vec<
         // Whitelist short acronyms (do not length-filter them)
         let keep_short = matches!(t.as_str(), "us" | "uk" | "eu" | "ai" | "un" | "nato");
 
-        if t.len() < 2 && !keep_short {
-            continue;
-        }
-
         // Filter: global/domain/outlet stop words
         if global_stop.contains(&t) {
             continue;
@@ -1071,13 +1435,9 @@ fn top_tokens_clean(text: &str, outlet_host: Option<&str>, limit: usize) -> Vec<
             continue;
         }
 
-        // Crude lemmatization (protect acronyms)
+        // Improved lemmatization (protect acronyms)
         if !keep_short {
-            if t.ends_with("ies") && t.len() > 3 {
-                t = t.trim_end_matches("ies").to_string() + "y";
-            } else if t.ends_with('s') && t.len() > 3 {
-                t.pop();
-            }
+            t = lemmatize_word(&t);
         }
 
         *bag.entry(t).or_insert(0) += 1;
@@ -1086,7 +1446,7 @@ fn top_tokens_clean(text: &str, outlet_host: Option<&str>, limit: usize) -> Vec<
     // Convert to vec, sort by freq, keep top N
     let mut v: Vec<(String, u32)> = bag.into_iter().collect();
 
-    // Deweight extremely common “generic news” terms that slipped through
+    // Deweight extremely common "generic news" terms that slipped through
     for (w, c) in &mut v {
         if GENERIC_NEWS_WORDS.contains(&w.as_str()) {
             *c = (*c as f32 * 0.5) as u32;
@@ -1101,16 +1461,164 @@ fn top_tokens_clean(text: &str, outlet_host: Option<&str>, limit: usize) -> Vec<
     v
 }
 
+/// Intelligent lemmatization with pattern recognition and proper noun detection
+fn lemmatize_word(word: &str) -> String {
+    // Handle common irregular plurals first
+    match word {
+        "countries" => return "country".to_string(),
+        "stories" => return "story".to_string(),
+        "cities" => return "city".to_string(),
+        "parties" => return "party".to_string(),
+        "companies" => return "company".to_string(),
+        "policies" => return "policy".to_string(),
+        "agencies" => return "agency".to_string(),
+        "people" => return "person".to_string(),
+        "children" => return "child".to_string(),
+        "men" => return "man".to_string(),
+        "women" => return "woman".to_string(),
+        _ => {}
+    }
+
+    let mut w = word.to_string();
+    
+    // Don't lemmatize short words (likely acronyms or proper nouns)
+    if w.len() <= 3 {
+        return w;
+    }
+    
+    // Handle -ies → -y plurals (but not words ending in -ries where the 'r' is part of the suffix)
+    if w.ends_with("ies") && w.len() > 4 {
+        let stem = &w[..w.len()-3];
+        // Don't convert if it would create an odd stem (e.g., "series" → "ser" is wrong)
+        if stem.len() >= 2 && !matches!(stem, "ser" | "quer" | "specif") {
+            return stem.to_string() + "y";
+        }
+    }
+    
+    // Check if word ends with 's' - be very selective about removing it
+    if w.ends_with('s') && w.len() > 4 {
+        // NEVER remove 's' from these endings (they're part of the word, not plural markers)
+        let non_plural_endings = [
+            "ss", "us", "is", "as",           // class, focus, analysis, canvas
+            "ness", "less", "ous", "ious",    // business, unless, famous, religious  
+            "ess", "ess",                      // princess, goddess
+            "sis", "osis", "asis",            // crisis, diagnosis, basis
+        ];
+        
+        if non_plural_endings.iter().any(|&ending| w.ends_with(ending)) {
+            return w;
+        }
+        
+        // Check for proper nouns / entities (capitalized words are likely proper nouns)
+        // This is heuristic since we've already lowercased, but we can check patterns
+        
+        // Names of places/people often end in specific patterns - don't lemmatize
+        let proper_noun_patterns = [
+            "mas",     // Hamas, Thomas, Christmas
+            "ris",     // Paris, Morris
+            "uis",     // Louis
+            "les",     // Angeles, Naples, Charles
+            "nos",     // Buenos Aires components
+            "os",      // Lagos, Carlos, Philippines-related
+            "as",      // Texas, Vegas, Atlas, Douglas, Nicholas
+            "es",      // Jones, Davies, Wales
+        ];
+        
+        // If it matches a proper noun pattern, be cautious
+        let matches_proper = proper_noun_patterns.iter().any(|&pattern| w.ends_with(pattern));
+        
+        if matches_proper {
+            // Additional check: if removing 's' would leave a very short or odd stem, keep it
+            let without_s = &w[..w.len()-1];
+            if without_s.len() < 3 || !looks_like_valid_stem(without_s) {
+                return w;
+            }
+        }
+        
+        // For other words ending in 's', check if it looks like a plural
+        // Common plural patterns: consonant + s (books, cats, dogs)
+        let without_s = &w[..w.len()-1];
+        
+        // If the stem ends with a vowel + consonant, it's likely a plural
+        // e.g., "books" → "book", "articles" → "article"
+        if is_likely_plural_stem(without_s) {
+            return without_s.to_string();
+        }
+        
+        // Otherwise, keep the 's'
+        return w;
+    }
+    
+    w
+}
+
+/// Check if removing 's' would create a valid-looking English stem
+fn looks_like_valid_stem(stem: &str) -> bool {
+    if stem.len() < 3 {
+        return false;
+    }
+    
+    // Check for valid consonant-vowel patterns
+    let chars: Vec<char> = stem.chars().collect();
+    let vowels = ['a', 'e', 'i', 'o', 'u', 'y'];
+    
+    // Must contain at least one vowel
+    if !chars.iter().any(|c| vowels.contains(c)) {
+        return false;
+    }
+    
+    // Check for problematic endings that suggest it's not a good stem
+    let bad_endings = ["ha", "te", "ri", "ma", "lu"];  // hama, testa, pari, etc.
+    if bad_endings.iter().any(|&ending| stem.ends_with(ending)) {
+        return false;
+    }
+    
+    true
+}
+
+/// Check if a word stem (without final 's') looks like it came from a plural
+fn is_likely_plural_stem(stem: &str) -> bool {
+    if stem.len() < 2 {
+        return false;
+    }
+    
+    let chars: Vec<char> = stem.chars().collect();
+    let vowels = ['a', 'e', 'i', 'o', 'u'];
+    let last = chars[chars.len() - 1];
+    
+    // Common plural patterns:
+    // 1. Ends with a consonant (not 's') → likely plural (book+s, cat+s)
+    // 2. Ends with 'e' after consonant → likely plural (article+s, mistake+s)
+    
+    if !vowels.contains(&last) && last != 's' {
+        return true; // consonant ending → likely plural
+    }
+    
+    if last == 'e' && chars.len() >= 2 {
+        let second_last = chars[chars.len() - 2];
+        if !vowels.contains(&second_last) {
+            return true; // consonant + e → likely plural
+        }
+    }
+    
+    // Ends with double letters → likely plural (add+s → adds)
+    if chars.len() >= 2 && chars[chars.len() - 1] == chars[chars.len() - 2] {
+        return true;
+    }
+    
+    false
+}
+
 fn strip_urls(s: &str) -> String {
     let re: Regex = regex_cached(r"https?://\S+");
     re.replace_all(s, " ").to_string()
 }
 
 fn normalize_apostrophes(s: &str) -> String {
-    // Remove possessives ’s/'s and unify quotes
-    let apos_re: Regex = regex_cached(r"[’']s\b");
+    // Remove possessives 's/'s and unify quotes
+    let apos_re: Regex = regex_cached(r"['']s\b");
     let mut out = apos_re.replace_all(s, "").to_string();
-    out = out.replace(['“', '”', '‘', '’'], "\"");
+    out = out.replace(['"', '"', '\'', '\''], "\"");
     out
 }
 
@@ -1188,6 +1696,7 @@ fn global_stopwords() -> &'static HashSet<String> {
             "is","are","was","were","be","been","being","that","this","it","its","at","from","into",
             "over","under","about","after","before","between","during","without","within","than",
             "not","no","yes","more","most","less","least","very","much","many","some","any","such",
+            "has","have","had","will","would","should","could","may","might","can",
             // pipeline/meta smells
             "source","article","articles","news","updated","update","analysis","live","breaking",
             "tag","tags","frame","frames","entity","entities","generated","ongoing","potential",
@@ -1204,6 +1713,13 @@ fn domain_stopwords() -> &'static HashSet<String> {
         let words = [
             "http", "https", "com", "org", "net", "www", "amp", "m", "co", "io", "newsroom", "press", "blog", "text",
             "apnews",
+            // Major outlet brand names to exclude from word clouds
+            "reuters", "ap", "bbc", "cnn", "npr", "nbc", "abc", "cbs", "fox", "msnbc",
+            "aljazeera", "jazeera", "al", "guardian", "times", "post", "journal", "telegraph",
+            "bloomberg", "economist", "politico", "axios", "vox", "vice", "buzzfeed",
+            "huffpost", "slate", "salon", "hill", "beast", "newsweek", "forbes",
+            "cnbc", "wsj", "nyt", "wapo", "ft", "afp", "dpa", "tass", "xinhua",
+            "independent", "express", "mirror", "mail", "sun", "sky", "itv", "rte",
         ];
         words.iter().map(|s| s.to_string()).collect()
     });
@@ -1304,4 +1820,54 @@ fn regex_cached(pat: &str) -> Regex {
     let key: &'static str = Box::leak(pat.to_string().into_boxed_str());
     w.insert(key, compiled.clone());
     compiled
+}
+
+/* -------------------------------------------------------------------------- */
+/* Root Index Management                                                      */
+/* -------------------------------------------------------------------------- */
+
+/// Updates or creates the root-level index.json file (e.g., viz/index.json)
+/// This file lists all available dates for the date picker in the JS visualization.
+fn update_root_index(root_dir: &Path, new_date: &str) -> Result<()> {
+    let index_path = root_dir.join("index.json");
+    
+    // Read existing index if it exists
+    let mut dates: BTreeSet<String> = BTreeSet::new();
+    
+    if index_path.exists() {
+        let existing_content = fs::read_to_string(&index_path)
+            .with_context(|| format!("Failed to read existing index at {:?}", index_path))?;
+        
+        if let Ok(existing_index) = serde_json::from_str::<serde_json::Value>(&existing_content) {
+            if let Some(dates_array) = existing_index.get("dates").and_then(|v| v.as_array()) {
+                for date_val in dates_array {
+                    if let Some(date_str) = date_val.as_str() {
+                        dates.insert(date_str.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Add the new date
+    dates.insert(new_date.to_string());
+    
+    // Convert to sorted Vec
+    let dates_vec: Vec<String> = dates.into_iter().collect();
+    
+    // Latest is the most recent date (last in sorted order)
+    let latest = dates_vec.last().cloned();
+    
+    // Create the index structure
+    let index = json!({
+        "dates": dates_vec,
+        "latest": latest,
+        "version": 1
+    });
+    
+    // Write the index
+    write_json(&index_path, &index)
+        .with_context(|| format!("Failed to write root index to {:?}", index_path))?;
+    
+    Ok(())
 }
