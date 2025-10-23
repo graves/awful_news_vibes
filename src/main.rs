@@ -144,7 +144,12 @@ async fn main() -> Result<()> {
         "Date range - yesterday={}, today={}, output_dir={}",
         ymd_yesterday, ymd_today, args.output_dir
     );
-    debug!("Using Eastern timezone - current_time={}", eastern_now.format("%Y-%m-%d %H:%M:%S %Z"));
+    info!(
+        "Timezone details - utc_time={}, eastern_time={}, eastern_offset={}",
+        utc_now.format("%Y-%m-%d %H:%M:%S UTC"),
+        eastern_now.format("%Y-%m-%d %H:%M:%S %Z"),
+        eastern_now.format("%z")
+    );
 
     // Load optional API configs for different LLM endpoints
     let cluster_cfg = if let Some(ref cluster_cfg_path) = args.cluster_config {
