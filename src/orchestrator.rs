@@ -44,19 +44,21 @@ pub async fn run_daily(
     let fetch_start = std::time::Instant::now();
     
     if let Some(api_path) = api_dir {
-        info!("Using local API directory: {}", api_path);
+        info!("Using local API directory for today's morning edition: {}", api_path);
+        info!("Fetching yesterday's editions from HTTP API");
     } else {
-        debug!("Fetching from HTTP API");
+        debug!("Fetching all editions from HTTP API");
     }
     
     debug!("Fetching 4 editions: {}/{{morning,afternoon,evening}}, {}/morning", ymd_yesterday, ymd_today);
 
     let mut fetched = Vec::new();
 
+    // Always fetch yesterday's editions from HTTP API (api_dir may be deleted after each run)
     for slot in ["morning", "afternoon", "evening"] {
-        match fetch_edition_opt(&client, ymd_yesterday, slot, api_dir).await? {
+        match fetch_edition_opt(&client, ymd_yesterday, slot, None).await? {
             Some(ed) => {
-                debug!("Successfully fetched: {}/{}", ymd_yesterday, slot);
+                debug!("Successfully fetched from HTTP: {}/{}", ymd_yesterday, slot);
                 fetched.push(ed);
             }
             None => {
@@ -64,9 +66,15 @@ pub async fn run_daily(
             }
         }
     }
+    
+    // Use api_dir for today's morning edition if provided
     match fetch_edition_opt(&client, ymd_today, "morning", api_dir).await? {
         Some(ed) => {
-            debug!("Successfully fetched: {}/morning", ymd_today);
+            if api_dir.is_some() {
+                debug!("Successfully fetched from local: {}/morning", ymd_today);
+            } else {
+                debug!("Successfully fetched from HTTP: {}/morning", ymd_today);
+            }
             fetched.push(ed);
         }
         None => {
