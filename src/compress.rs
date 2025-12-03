@@ -8,7 +8,7 @@ pub async fn llm_call(cfg: &AwfulJadeConfig, tpl: &ChatTemplate, user: &str) -> 
     debug!("LLM call starting - prompt_length={} chars", user.len());
     
     // Map Box<dyn StdError> -> anyhow::Error *before* `?`
-    let answer = ask(cfg, user.to_string(), tpl, None, None)
+    let answer = ask(cfg, user.to_string(), tpl, None, None, false)
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
     
